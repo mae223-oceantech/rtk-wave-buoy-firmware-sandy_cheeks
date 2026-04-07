@@ -54,3 +54,9 @@ dkms.conf
 # Personal WiFi config
 secrets.h
 
+# Jupyter notebooks
+imu_analysis.ipynb
+
+# Local SD card data
+ola_data/
+
