@@ -107,7 +107,7 @@ This writes your settings to the ZED-F9P's non-volatile memory so they survive a
 
 NTRIP delivers RTK correction data to your rover (the ZED-F9P). Polaris uses a **Virtual Reference Station (VRS)** — rather than streaming corrections from a single fixed base station, it uses your rover's position to synthesize optimal corrections from the nearest stations in its nationwide network. To do this, your NTRIP client must send its GPS position (as an NMEA GGA sentence) back to the server after connecting.
 
-u-center handles this automatically. In the field deployment, `esp32_polaris.ino` does the same thing in firmware.
+u-center handles this automatically. In the field deployment, `esp32_polaris.ino` does the same thing in firmware — sending GGA on connect and refreshing every 5 minutes (sufficient for a slowly-drifting buoy given the kilometre-scale of the VRS correction field).
 
 1. Go to **Receiver → NTRIP Client...**
 2. Fill in the connection details:

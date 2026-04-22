@@ -17,9 +17,10 @@
   Hardware:
     Sparkfun ESP32 Thing Plus + u-blox ZED-F9P
 
-  Wiring:
-    ESP32 GPIO 16 (RX1) to ZED-F9P TX
-    ESP32 GPIO 17 (TX1) to ZED-F9P RX
+  Wiring (matches buoy_combo / polaris — avoids GPIO 12 strapping conflict
+  because GPIO 12 is used as ESP32 TX, not RX, so F9P never drives it at boot):
+    ESP32 GPIO 27 (RX2) to ZED-F9P TX2
+    ESP32 GPIO 12 (TX2) to ZED-F9P RX2
     ESP32 GND to ZED-F9P GND
 
   ESP32 mechanics:
@@ -87,7 +88,7 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  Serial2.begin(115200, SERIAL_8N1, 16, 17); // RX=GPIO16, TX=GPIO17
+  Serial2.begin(115200, SERIAL_8N1, 27, 12); // RX=GPIO27, TX=GPIO12 (matches buoy_combo)
   if (myGNSS.begin(Serial2) == false) {
     Serial.println("ZED-F9P not detected on UART2. Check wiring/baud.");
     while(1);
@@ -156,11 +157,58 @@ void loop()
   }
 }
 
+
+// Build NMEA GGA sentence from current ZED-F9P position.
+// Sent to the Polaris caster so VRS knows where to compute corrections.
+// If F9P has no fix yet, quality=0 is reported and Polaris will wait.
+String buildGGA() {
+  double lat = myGNSS.getLatitude()    / 10000000.0;
+  double lon = myGNSS.getLongitude()   / 10000000.0;
+  double alt = myGNSS.getAltitudeMSL() / 1000.0;
+  uint8_t fix     = myGNSS.getFixType();
+  uint8_t siv     = myGNSS.getSIV();
+  uint8_t carrier = myGNSS.getCarrierSolutionType();
+  uint8_t h = myGNSS.getHour();
+  uint8_t m = myGNSS.getMinute();
+  uint8_t s = myGNSS.getSecond();
+
+  // GGA quality: 0=invalid, 1=GPS, 4=RTK Fixed, 5=RTK Float
+  int quality = 0;
+  if (fix >= 2) {
+    if      (carrier == 2) quality = 4;
+    else if (carrier == 1) quality = 5;
+    else                   quality = 1;
+  }
+
+  char latDir = (lat >= 0) ? 'N' : 'S';
+  double absLat = fabs(lat);
+  int latDeg    = (int)absLat;
+  double latMin = (absLat - latDeg) * 60.0;
+
+  char lonDir = (lon >= 0) ? 'E' : 'W';
+  double absLon = fabs(lon);
+  int lonDeg    = (int)absLon;
+  double lonMin = (absLon - lonDeg) * 60.0;
+
+  char body[128];
+  snprintf(body, sizeof(body),
+    "GPGGA,%02d%02d%02d.00,%02d%07.4f,%c,%03d%07.4f,%c,%d,%02d,1.0,%.2f,M,0.0,M,,",
+    h, m, s, latDeg, latMin, latDir, lonDeg, lonMin, lonDir, quality, siv, alt);
+
+  uint8_t checksum = 0;
+  for (int i = 0; body[i] != '\0'; i++) checksum ^= (uint8_t)body[i];
+
+  char sentence[140];
+  snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", body, checksum);
+  return String(sentence);
+}
+
 //Connect to NTRIP Caster, receive RTCM, and push to ZED module over I2C
 void beginClient()
 {
   WiFiClient ntripClient;
   long rtcmCount = 0;
+  unsigned long lastGGASent_ms = 0;
 
   Serial.println(F("Subscribing to Caster. Press button to stop. LED ON = running"));
 
@@ -220,8 +268,12 @@ void beginClient()
         const int SERVER_BUFFER_SIZE  = 512;
         char serverRequest[SERVER_BUFFER_SIZE];
 
-        snprintf(serverRequest, SERVER_BUFFER_SIZE, "GET /%s HTTP/1.0\r\nUser-Agent: NTRIP SparkFun u-blox Client v1.0\r\n",
-                 mountPoint);
+        snprintf(serverRequest, SERVER_BUFFER_SIZE,
+          "GET /%s HTTP/1.1\r\n"
+          "Host: %s\r\n"
+          "Ntrip-Version: Ntrip/2.0\r\n"
+          "User-Agent: NTRIP SparkFun u-blox Client v1.0\r\n",
+          mountPoint, casterHost);
 
         char credentials[512];
         if (strlen(casterUser) == 0)
@@ -316,6 +368,13 @@ void beginClient()
           Serial.print(F("Connected to "));
           Serial.println(casterHost);
           lastReceivedRTCM_ms = millis(); //Reset timeout
+
+          // Send initial GGA so Polaris VRS knows our position
+          String gga = buildGGA();
+          ntripClient.print(gga);
+          lastGGASent_ms = millis();
+          Serial.print(F("Sent initial GGA: "));
+          Serial.print(gga);
         }
       } //End attempt to connect
     } //End connected == false
@@ -325,12 +384,43 @@ void beginClient()
       uint8_t rtcmData[512 * 4]; //Most incoming data is around 500 bytes but may be larger
       rtcmCount = 0;
 
+      // Refresh GGA every 10s to keep Polaris VRS position current
+      if (millis() - lastGGASent_ms > 10000)
+      {
+        String gga = buildGGA();
+        ntripClient.print(gga);
+        lastGGASent_ms = millis();
+        Serial.println(F("GGA sent to caster"));
+      }
+
       //Print any available RTCM data
       while (ntripClient.available())
       {
-        //Serial.write(ntripClient.read()); //Pipe to serial port is fine but beware, it's a lot of binary data
-        rtcmData[rtcmCount++] = ntripClient.read();
-        if (rtcmCount == sizeof(rtcmData)) break;
+        // Read chunk size line (hex digits followed by \r\n)
+        char chunkSizeBuf[10];
+        int idx = 0;
+        while (ntripClient.available()) {
+          char c = ntripClient.read();
+          if (c == '\n') break;
+          if (c != '\r') chunkSizeBuf[idx++] = c;
+        }
+        chunkSizeBuf[idx] = '\0';
+        int chunkSize = strtol(chunkSizeBuf, NULL, 16);
+        if (chunkSize == 0) break; // last chunk
+
+        // Read exactly chunkSize bytes of RTCM
+        int bytesRead = 0;
+        while (bytesRead < chunkSize && ntripClient.available()) {
+          rtcmData[rtcmCount++] = ntripClient.read();
+          bytesRead++;
+          if (rtcmCount == sizeof(rtcmData)) break;
+        }
+        // Consume trailing \r\n after chunk data
+        while (ntripClient.available()) {
+          char c = ntripClient.read();
+          if (c == '\n') break;
+        }
+        break; // process what we have, come back next loop iteration
       }
 
       if (rtcmCount > 0)

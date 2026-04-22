@@ -105,7 +105,7 @@ int maxTimeBeforeHangup_ms = 100000;
 unsigned long lastGPSBroadcast_ms = 0;
 const unsigned long gpsBroadcastInterval_ms = 5000;  // GPS update over BLE every 5s
 unsigned long lastGGASent_ms = 0;
-const unsigned long ggaInterval_ms = 5000;           // Resend GGA to Polaris VRS every 5s
+const unsigned long ggaInterval_ms = 300000;         // Resend GGA every 5 min — buoy drift is slow relative to VRS correction scale (~km)
 
 // ============================================================
 // BLE output helper - sends to Serial and BLE simultaneously

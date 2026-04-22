@@ -211,7 +211,7 @@ unsigned long lastIMUReadTime = 0; // - Amara
 void setup() {
   //If 3.3V rail drops below 3V, system will power down and maintain RTC
   pinMode(PIN_POWER_LOSS, INPUT); // BD49K30G-TL has CMOS output and does not need a pull-up
-  
+
   delay(1); // Let PIN_POWER_LOSS stabilize
 
   if (digitalRead(PIN_POWER_LOSS) == LOW) powerDown(); //Check PIN_POWER_LOSS just in case we missed the falling edge
