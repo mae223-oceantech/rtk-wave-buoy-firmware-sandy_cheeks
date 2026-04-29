@@ -80,17 +80,30 @@ Under **CFG-RATE:**
 
 Click **Send** after changing values.
 
-### Enable Raw Measurement Messages
+### Enable Required Messages
 
-Under **CFG-MSG**, enable the following messages on the **USB** port:
+Under **CFG-MSG**, enable the following messages. For each one, check the column(s shown below and click **Send**.
 
-| Message | Purpose |
-|---------|---------|
-| RXM-RAWX | Raw pseudorange and carrier phase — needed for RTKLIB post-processing |
-| RXM-SFRBX | Satellite navigation data — needed for RTKLIB |
-| NAV-PVT | Position, velocity, time — the main output used by the OLA |
+| Message | Enable on | Purpose |
+|---------|-----------|---------|
+| NAV-PVT | **USB** and **I2C** | Position, velocity, time — used by both u-center and the OLA over Qwiic |
+| NAV-HPPOSLLH | **USB** and **I2C** | High-precision lat/lon/alt — required for centimetre-level OLA logging |
+| RXM-RAWX | **USB** | Raw pseudorange and carrier phase — needed for RTKLIB post-processing |
+| RXM-SFRBX | **USB** | Satellite navigation data — needed for RTKLIB |
 
-For each message: select it from the list, check the **USB** column, and click **Send**.
+> **NAV-HPPOSLLH must be enabled on I2C** for the OLA to log centimetre-level positions. Without it the OLA falls back to standard NAV-PVT accuracy (~1–3 m).
+
+### Configure UART1 for ESP32 (field deployment)
+
+If you will be using the ESP32 to deliver Polaris corrections in the field, UART1 must be configured correctly. Under **CFG-MSG → PRT → UART1**:
+
+- Baud rate: `115200`
+- Protocol in: **UBX** and **RTCM3**
+- Protocol out: **UBX**
+
+Click **Send**.
+
+> The ZED-F9P ships with UART1 at 9600 baud. The ESP32 firmware expects 115200 — this step is required or the ESP32 will not detect the ZED-F9P.
 
 ### Save Configuration
 
@@ -107,7 +120,7 @@ This writes your settings to the ZED-F9P's non-volatile memory so they survive a
 
 NTRIP delivers RTK correction data to your rover (the ZED-F9P). Polaris uses a **Virtual Reference Station (VRS)** — rather than streaming corrections from a single fixed base station, it uses your rover's position to synthesize optimal corrections from the nearest stations in its nationwide network. To do this, your NTRIP client must send its GPS position (as an NMEA GGA sentence) back to the server after connecting.
 
-u-center handles this automatically. In the field deployment, `esp32_polaris.ino` does the same thing in firmware — sending GGA on connect and refreshing every 5 minutes (sufficient for a slowly-drifting buoy given the kilometre-scale of the VRS correction field).
+u-center handles this automatically. In the field deployment, `esp32_polaris_wifi.ino` does the same thing in firmware — sending GGA on connect and refreshing every 10 seconds to keep the VRS solution centred on the buoy's current position.
 
 1. Go to **Receiver → NTRIP Client...**
 2. Fill in the connection details:
@@ -151,18 +164,29 @@ Note the horizontal accuracy value in the Data View as it improves from metres d
 
 While u-center is running, the OLA is simultaneously reading position data from the ZED-F9P over Qwiic (I2C). These two connections use separate ports on the ZED-F9P and do not interfere with each other.
 
-If you have a serial terminal open on the OLA (see `tutorials/SERIAL_MONITOR_SETUP.md`):
+If you have a serial terminal open on the OLA at 115200 baud (see `tutorials/SERIAL_MONITOR_SETUP.md`), you will see timestamped UBX message confirmations:
 
 ```
-2026/04/20 15:42:11.00,GNSS,32.87012,-117.25341,20.412,2,2,0.012,0.018,...
+2026/04/28 23:00:32.67 NAV-PVT
+2026/04/28 23:00:32.68 NAV-HPPOSLLH
+2026/04/28 23:00:32.70,IMU,-917.48,-295.90,-336.43,1.06,-0.43,-1.50,...
 ```
 
-The `carrier_solution` column (second-to-last) will show:
-- `0` — no RTK
-- `1` — RTK Float
-- `2` — RTK Fixed
+The presence of `NAV-HPPOSLLH` lines confirms the OLA is receiving high-precision position data. RTK status is not shown in the serial output — check the SD card log file after collection.
 
-Once you see `2` in the log, you are recording centimetre-level positions.
+### OLA Config File
+
+The OLA reads `OLA_GNSS_settings.cfg` from the SD card on boot. The following settings must be present for correct operation:
+
+| Setting | Required value | Purpose |
+|---------|---------------|---------|
+| `GNSS:logUBXNAVPVT` | `1` | Log standard position messages |
+| `GNSS:logUBXNAVHPPOSLLH` | `1` | Log high-precision position — **required for cm-level data** |
+| `useGPIO32ForStopLogging` | `1` | Allow clean log file close by shorting GPIO32 to GND |
+
+To close the log file cleanly before removing the SD card, momentarily short the **GPIO32 pin to GND** on the OLA. This flushes and closes the file. Do not remove the SD card while the OLA is writing.
+
+Once you see `2` in the `carrier_solution` field of the parsed log, you are recording centimetre-level positions.
 
 ---
 

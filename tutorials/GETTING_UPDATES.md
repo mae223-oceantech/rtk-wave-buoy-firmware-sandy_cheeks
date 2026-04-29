@@ -16,7 +16,7 @@ Your GitHub Classroom repo and the instructor's main repo are separate. To recei
 ## Step 1: One-Time Setup (do this once after accepting the assignment)
 
 ```bash
-git remote add upstream https://github.com/missioncreep11/rtk-wave-buoy
+git remote add upstream https://github.com/mae223-oceantech/mae223-ocean-tech-2026-rtk-wave-buoy-firmware-mae223-ocean-tech-2026-rtk-wave-buoy-firmware-rtk-wave
 ```
 
 Verify it worked:
@@ -30,8 +30,8 @@ You should see:
 ```
 origin    https://github.com/YOUR-USERNAME/YOUR-CLASSROOM-REPO (fetch)
 origin    https://github.com/YOUR-USERNAME/YOUR-CLASSROOM-REPO (push)
-upstream  https://github.com/missioncreep11/rtk-wave-buoy (fetch)
-upstream  https://github.com/missioncreep11/rtk-wave-buoy (push)
+upstream  https://github.com/mae223-oceantech/mae223-ocean-tech-2026-rtk-wave-buoy-firmware-mae223-ocean-tech-2026-rtk-wave-buoy-firmware-rtk-wave (fetch)
+upstream  https://github.com/mae223-oceantech/mae223-ocean-tech-2026-rtk-wave-buoy-firmware-mae223-ocean-tech-2026-rtk-wave-buoy-firmware-rtk-wave (push)
 ```
 
 ---
@@ -106,7 +106,7 @@ git push origin main
 
 ```bash
 # One-time setup
-git remote add upstream https://github.com/missioncreep11/rtk-wave-buoy
+git remote add upstream https://github.com/mae223-oceantech/mae223-ocean-tech-2026-rtk-wave-buoy-firmware-mae223-ocean-tech-2026-rtk-wave-buoy-firmware-rtk-wave
 
 # Every time the instructor announces an update
 git add .

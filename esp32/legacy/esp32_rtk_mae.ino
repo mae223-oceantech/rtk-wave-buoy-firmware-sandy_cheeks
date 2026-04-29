@@ -18,9 +18,11 @@
     Sparkfun ESP32 Thing Plus + u-blox ZED-F9P
 
   Wiring (matches buoy_combo / polaris — avoids GPIO 12 strapping conflict
-  because GPIO 12 is used as ESP32 TX, not RX, so F9P never drives it at boot):
-    ESP32 GPIO 27 (RX2) to ZED-F9P TX2
-    ESP32 GPIO 12 (TX2) to ZED-F9P RX2
+  because GPIO 12 is used as ESP32 TX, not RX, so F9P never drives it at boot).
+  F9P UART1 pins are the pads labeled TX1/MISO and RX1/MOSI on the SparkFun
+  breakout (the MISO/MOSI labels are the shared SPI names on the same pads):
+    ESP32 GPIO 27 (RX) to ZED-F9P TX1/MISO   (F9P UART1)
+    ESP32 GPIO 12 (TX) to ZED-F9P RX1/MOSI   (F9P UART1)
     ESP32 GND to ZED-F9P GND
 
   ESP32 mechanics:
@@ -97,7 +99,9 @@ void setup()
   myGNSS.setPortInput(COM_PORT_UART1, COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3); //Be sure RTCM3 input is enabled. UBX + RTCM3 is not a valid state.
   myGNSS.setUART1Output(COM_TYPE_UBX); // Turn off NMEA noise on UART2
 
-  myGNSS.setNavigationFrequency(10); //Set output in Hz.
+  // 5 Hz is a balance: captures wave motion (periods ~5-20 s) without
+  // starving the RTK engine's ambiguity search (u-blox default is 1 Hz).
+  myGNSS.setNavigationFrequency(5);
   
   Serial.print(F("Connecting to local WiFi"));
   WiFi.begin(ssid, password);
@@ -384,8 +388,10 @@ void beginClient()
       uint8_t rtcmData[512 * 4]; //Most incoming data is around 500 bytes but may be larger
       rtcmCount = 0;
 
-      // Refresh GGA every 10s to keep Polaris VRS position current
-      if (millis() - lastGGASent_ms > 10000)
+      // Refresh GGA every 5 min to keep Polaris VRS position current.
+      // Buoy drift over 5 min is tens of meters at most, well inside the
+      // km-scale interpolation the VRS uses to build a virtual base.
+      if (millis() - lastGGASent_ms > 300000)
       {
         String gga = buildGGA();
         ntripClient.print(gga);
@@ -393,7 +399,12 @@ void beginClient()
         Serial.println(F("GGA sent to caster"));
       }
 
-      //Print any available RTCM data
+      // Polaris answers NTRIP 2.0 (HTTP/1.1) with chunked transfer encoding:
+      //   <hex chunk size>\r\n<binary RTCM of that size>\r\n<next hex size>...
+      // The chunk framing bytes MUST be stripped before pushing to the F9P,
+      // otherwise the hex digits and \r\n land in the F9P's protocol decoder
+      // as noise and every frame is rejected (MON-COMMS "skipped" climbs to
+      // ~100% of rx, RTK never fixes).
       while (ntripClient.available())
       {
         // Read chunk size line (hex digits followed by \r\n)
@@ -434,15 +445,15 @@ void beginClient()
       }
     }
 
-    //Close socket if we don't have new data for 10s
+    // RTCM silent too long -> drop the socket and let the outer loop reconnect
     if (millis() - lastReceivedRTCM_ms > maxTimeBeforeHangup_ms)
     {
-      Serial.println(F("RTCM timeout. Disconnecting..."));
+      Serial.println(F("RTCM timeout. Reconnecting to caster..."));
       if (ntripClient.connected() == true)
         ntripClient.stop();
-      ntripRunning = false;
-      digitalWrite(LED_PIN, LOW);
-      return;
+      lastReceivedRTCM_ms = millis(); // reset so we don't immediately re-trigger
+      delay(1000);                    // brief backoff before the reconnect attempt
+      continue;                       // back to top of while(ntripRunning)
     }
 
     delay(10);

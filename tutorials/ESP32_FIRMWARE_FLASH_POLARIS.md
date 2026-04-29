@@ -21,8 +21,8 @@ Point One Navigation's Polaris network, using either Arduino IDE or arduino-cli.
 Clone the repo on the computer connected to the ESP32:
 
 ```bash
-git clone git@github.com:missioncreep11/rtk-wave-buoy.git
-cd rtk-wave-buoy
+git clone https://github.com/mae223-oceantech/mae223-ocean-tech-2026-rtk-wave-buoy-firmware-mae223-ocean-tech-2026-rtk-wave-buoy-firmware-rtk-wave.git
+cd mae223-ocean-tech-2026-rtk-wave-buoy-firmware-mae223-ocean-tech-2026-rtk-wave-buoy-firmware-rtk-wave
 ```
 
 ---
@@ -31,7 +31,34 @@ cd rtk-wave-buoy
 
 `secrets.h` holds WiFi and Polaris credentials. It is **not committed to git** — you must create it on each machine you flash from.
 
-**Where to get Polaris credentials:** log in at app.pointonenav.com → Devices or API Keys → create a new key. The username is your email; the password is the API key.
+### File format
+
+Create a plain text file named exactly `secrets.h` with this content, filling in your own values:
+
+```cpp
+const char ssid[]           = "YourWiFiName";
+const char password[]       = "YourWiFiPassword";
+
+const char casterHost[]     = "polaris.pointonenav.com";
+const uint16_t casterPort   = 2101;
+const char casterUser[]     = "your@email.com";
+const char casterUserPW[]   = "your-api-key";
+const char mountPoint[]     = "POLARIS";
+```
+
+### Field reference
+
+| Field | What to enter |
+|---|---|
+| `ssid` | Your WiFi network name. **Must be 2.4 GHz** — the ESP32 does not support 5 GHz. |
+| `password` | Your WiFi password. |
+| `casterHost` | Leave exactly as shown — this is the Polaris NTRIP caster address. |
+| `casterPort` | Leave as `2101` — this is the standard NTRIP port. |
+| `casterUser` | The class Polaris username — see the Canvas assignment for this value. |
+| `casterUserPW` | The class Polaris password — see the Canvas assignment for this value. |
+| `mountPoint` | Leave as `POLARIS`. |
+
+> The `casterUser` and `casterUserPW` values were distributed as a Canvas assignment. Do not share them outside the class.
 
 ---
 
@@ -62,18 +89,7 @@ WiFi and base64 are built into the ESP32 board package — no separate install n
 
 ### A4 — Create secrets.h in the sketch folder
 
-Arduino IDE will have moved the sketch to a new folder (e.g. `~/Documents/Arduino/esp32_polaris_wifi/`). Create `secrets.h` there:
-
-```cpp
-const char ssid[]           = "YourWiFiName";
-const char password[]       = "YourWiFiPassword";
-
-const char casterHost[]     = "polaris.pointonenav.com";
-const uint16_t casterPort   = 2101;
-const char casterUser[]     = "your@email.com";
-const char casterUserPW[]   = "your-api-key";
-const char mountPoint[]     = "POLARIS";
-```
+Arduino IDE will have moved the sketch to a new folder (e.g. `~/Documents/Arduino/esp32_polaris_wifi/`). Create `secrets.h` there using the template and field reference from Step 2.
 
 ### A5 — Select board and port
 
