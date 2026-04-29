@@ -80,6 +80,14 @@ void callbackNAVPVT(UBX_NAV_PVT_data_t *ubxDataStruct)
       myRTC.setTime(centis, ubxDataStruct->sec, ubxDataStruct->min, ubxDataStruct->hour, ubxDataStruct->day, ubxDataStruct->month, (ubxDataStruct->year - 2000)); //Set the RTC
       rtcHasBeenSyncd = true; //Set rtcHasBeenSyncd to show RTC has been sync'd
       rtcNeedsSync = false; //Clear rtcNeedsSync so we don't set the RTC multiple times
+
+      // Re-stamp log files now that the RTC has the correct UTC time.
+      // beginDataLogging() ran before GNSS had a fix, so the creation timestamps
+      // written then were wrong. This is the first opportunity to correct them.
+      updateDataFileCreate(&gnssDataFile);
+      if (imuDataFile)
+        updateDataFileCreate(&imuDataFile);
+
       if (settings.printMinorDebugMessages == true)
       {
         Serial.printf("callbackNAVPVT: RTC sync'd to %04d/%02d/%02d %02d:%02d:%02d.%02d\r\n", ubxDataStruct->year, ubxDataStruct->month, ubxDataStruct->day, ubxDataStruct->hour, ubxDataStruct->min, ubxDataStruct->sec, centis);
