@@ -1,8 +1,8 @@
 /*
-  ESP32 Cellular NTRIP Client — RTK Wave Buoy
+  ESP32 Cellular NTRIP Client — RTK Wave Buoy  (+ live telemetry)
   SIM7000 LTE + ZED-F9P
 
-  Two modes, selected by the define below:
+  Two NTRIP modes, selected by the define below:
 
     USE_POLARIS_CELLULAR commented out (default):
       Cellular + SIO / fixed-base caster
@@ -11,9 +11,13 @@
     USE_POLARIS_CELLULAR defined:
       Cellular + Point One Nav Polaris
       HTTP/1.1 chunked stream, GGA sent every 10 s.
-      Polaris is a VRS — it needs your GPS position to synthesize a
-      virtual base station near the rover, so GGA is sent upstream
-      over the same TCP connection that RTCM comes down on.
+
+  Telemetry (NEW):
+    Every TELEMETRY_INTERVAL_MS the NTRIP connection is paused (~10 s),
+    a JSON snapshot is HTTP-POSTed to TELEMETRY_HOST/data, then NTRIP
+    reconnects automatically.  Run tools/buoy_server.py on your laptop
+    and expose it with:  ngrok http --domain=<your-static-domain> 5000
+    Put your ngrok domain in secrets.h as TELEMETRY_HOST.
 
   Wiring:
     ESP32 GPIO 27 (RX2) → ZED-F9P TX1/MISO   (F9P UART1)
@@ -98,15 +102,18 @@ int reconnectCount        = 0;
 unsigned long sessionStart_ms = 0;
 unsigned long rtcmTotalBytes  = 0;
 
-uint8_t lastCarrierSolution          = 255;  // 255 = not yet known
-unsigned long lastRTKFixMsg_ms       = 0;
-const unsigned long rtkFixMsgInterval_ms = 10000;  // repeat RTK-fixed banner every 10 s
-
 #ifdef USE_POLARIS_CELLULAR
 int desyncSuspectCount   = 0;
 int trailingCRLFMismatch = 0;
 const unsigned long ggaInterval_ms = 10000;
 #endif
+
+// ============================================================
+// [TELEMETRY] Interval between telemetry posts (ms).
+// The NTRIP connection is closed for ~10 s each time this fires.
+// ============================================================
+const unsigned long telemetryInterval_ms = 60000;
+unsigned long lastTelemetry_ms = 0;
 
 // ============================================================
 // Setup
@@ -115,9 +122,9 @@ void setup() {
   Serial.begin(115200);
 
 #ifdef USE_POLARIS_CELLULAR
-  Serial.println(F("RTK Wave Buoy — Cellular/Polaris NTRIP Client"));
+  Serial.println(F("RTK Wave Buoy — Cellular/Polaris NTRIP Client + Telemetry"));
 #else
-  Serial.println(F("RTK Wave Buoy — Cellular/SIO NTRIP Client"));
+  Serial.println(F("RTK Wave Buoy — Cellular/SIO NTRIP Client + Telemetry"));
 #endif
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -136,8 +143,7 @@ void setup() {
   if (attempts >= 5) {
     Serial.println(F("ERROR: ZED-F9P not found. Check wiring."));
   } else {
-    Serial.println(F("===== ZED-F9P GPS connected! ====="));
-    // 5 Hz captures wave motion (periods ~5-20 s) without exceeding F9P's RTK ceiling
+    Serial.println(F("ZED-F9P connected."));
     myGNSS.setNavigationFrequency(5);
   }
 
@@ -148,7 +154,6 @@ void setup() {
   Serial.println(F("Powering on modem..."));
   modem.powerOn(BOTLETICS_PWRKEY);
 
-  // SIM7000 boots at 115200; drop to 9600 for stability
   // NOTE: ESP32 HardwareSerial::begin signature is begin(baud, config, rxPin, txPin),
   // so the canonical call would be (..., RX_MODEM, TX_MODEM). The order below
   // (TX_MODEM, RX_MODEM) appears swapped, but it matches the TA's working setup —
@@ -156,7 +161,7 @@ void setup() {
   modemSS.begin(115200, SERIAL_8N1, TX_MODEM, RX_MODEM);
   Serial.println(F("Configuring modem to 9600 baud"));
   modemSS.println("AT+IPR=9600");
-  delay(3000);
+  delay(1000);
   modemSS.begin(9600, SERIAL_8N1, TX_MODEM, RX_MODEM);
 
   if (!modem.begin(modemSS)) {
@@ -168,10 +173,13 @@ void setup() {
   uint8_t imeiLen = modem.getIMEI(imei);
   if (imeiLen > 0) { Serial.print(F("IMEI: ")); Serial.println(imei); }
 
-  modem.setFunctionality(1);                  // AT+CFUN=1 — full RF on
-  modem.setNetworkSettings(F(CELLULAR_APN));  // APN from secrets.h
+  modem.setFunctionality(1);
+  modem.setNetworkSettings(F(CELLULAR_APN));
 
-  // Wait for LTE registration (up to 60 s)
+  // [TELEMETRY] Enable SSL so postData() can reach the ngrok HTTPS URL.
+  modem.setHTTPSRedirect(true);
+
+  // Wait for LTE registration
   Serial.println(F("Waiting for network registration..."));
   uint8_t netStatus = 0;
   unsigned long netStart = millis();
@@ -198,7 +206,7 @@ void setup() {
       Serial.print(F("GPRS attempt ")); Serial.print(i); Serial.println(F("/3"));
       if (modem.enableGPRS(true)) {
         gprsEnabled = true;
-        Serial.println(F("===== Cellular/GPRS connected! ====="));
+        Serial.println(F("GPRS enabled."));
       } else {
         delay(i * 3000);
       }
@@ -207,7 +215,8 @@ void setup() {
       Serial.println(F("WARNING: GPRS failed. Check SIM card and APN in secrets.h."));
   }
 
-  sessionStart_ms = millis();
+  sessionStart_ms    = millis();
+  lastTelemetry_ms   = millis();  // [TELEMETRY] don't post immediately on boot
   Serial.println(F("Press GPIO 0 button to start/stop NTRIP. Blinking LED = ready."));
 }
 
@@ -250,7 +259,6 @@ void loop() {
 // Helpers
 // ============================================================
 
-// Re-enable GPRS if the signal was lost. Returns true if ready.
 bool ensureGPRS() {
   uint8_t netStat = modem.getNetworkStatus();
   if (gprsEnabled && (netStat == 1 || netStat == 5)) return true;
@@ -263,11 +271,51 @@ bool ensureGPRS() {
   return gprsEnabled;
 }
 
+// ============================================================
+// [TELEMETRY] postTelemetry
+// Reads the current ZED-F9P state and POSTs a JSON snapshot to
+// TELEMETRY_HOST/data.  Call this only after closing the NTRIP
+// TCP socket — the modem's HTTP layer and active TCP socket
+// cannot run simultaneously.
+// ============================================================
+void postTelemetry() {
+  myGNSS.getPVT();
+  uint8_t carrier = myGNSS.getCarrierSolutionType();
+  uint8_t siv     = myGNSS.getSIV();
+  double  lat     = myGNSS.getLatitude()    / 10000000.0;
+  double  lon     = myGNSS.getLongitude()   / 10000000.0;
+  double  alt     = myGNSS.getAltitudeMSL() / 1000.0;
+
+  char latBuf[14], lonBuf[14], altBuf[10];
+  dtostrf(lat, 1, 6, latBuf);
+  dtostrf(lon, 1, 6, lonBuf);
+  dtostrf(alt, 1, 1, altBuf);
+
+  char url[100];
+  snprintf(url, sizeof(url), "https://" TELEMETRY_HOST "/data");
+
+  char body[220];
+  snprintf(body, sizeof(body),
+    "{\"lat\":%s,\"lon\":%s,\"alt\":%s,"
+    "\"carrier\":%d,\"siv\":%d,"
+    "\"rtcm_bytes\":%lu,\"reconnects\":%d,\"uptime_s\":%lu}",
+    latBuf, lonBuf, altBuf,
+    carrier, siv,
+    rtcmTotalBytes, reconnectCount, millis() / 1000UL);
+
+  Serial.print(F("[telemetry] POST → ")); Serial.println(url);
+  Serial.print(F("[telemetry] ")); Serial.println(body);
+
+  if (!modem.postData("POST", url, body)) {
+    Serial.println(F("[telemetry] POST failed"));
+  } else {
+    Serial.println(F("[telemetry] OK"));
+  }
+}
+
 #ifdef USE_POLARIS_CELLULAR
-// NMEA GGA from ZED-F9P position. Polaris uses this to synthesize a virtual
-// base station near the rover. quality=0 if no fix — Polaris waits for a real fix.
 String buildGGA() {
-  myGNSS.getPVT();   // cache all NAV-PVT fields in one poll
+  myGNSS.getPVT();
 
   double lat = myGNSS.getLatitude()    / 10000000.0;
   double lon = myGNSS.getLongitude()   / 10000000.0;
@@ -304,8 +352,6 @@ String buildGGA() {
   return String(sentence);
 }
 
-// Byte cache for the chunked decoder. modem.TCPread() delivers batches;
-// readByteCellular() serves one byte at a time, refilling from TCPread() when empty.
 static uint8_t _cellBuf[256];
 static int     _cellBufLen = 0;
 static int     _cellBufIdx = 0;
@@ -329,7 +375,6 @@ int readByteCellular(uint32_t timeout_ms) {
 
 // ============================================================
 // Cellular + Polaris beginClient
-// HTTP/1.1 chunked stream, GGA sent on connect and every ggaInterval_ms.
 // ============================================================
 #ifdef USE_POLARIS_CELLULAR
 
@@ -359,26 +404,11 @@ void beginClient() {
     if (millis() - lastDiag_ms > 1000) {
       lastDiag_ms = millis();
       myGNSS.getPVT();
-      uint8_t carrier = myGNSS.getCarrierSolutionType();
-      uint8_t siv     = myGNSS.getSIV();
-      Serial.print(F("[diag] carrier="));   Serial.print(carrier);
-      Serial.print(F(" siv="));             Serial.print(siv);
+      Serial.print(F("[diag] carrier="));   Serial.print(myGNSS.getCarrierSolutionType());
+      Serial.print(F(" siv="));             Serial.print(myGNSS.getSIV());
       Serial.print(F(" rtcmTotal="));       Serial.print(rtcmTotalBytes);
       Serial.print(F(" desyncSuspect="));   Serial.print(desyncSuspectCount);
       Serial.print(F(" crlfMismatch="));    Serial.println(trailingCRLFMismatch);
-
-      if (carrier != lastCarrierSolution) {
-        if      (carrier == 2) Serial.println(F("===== RTK FIXED! ====="));
-        else if (carrier == 1) Serial.println(F("[RTK] Float solution acquired"));
-        else if (lastCarrierSolution != 255) Serial.println(F("[RTK] Fix lost — no RTK"));
-        lastCarrierSolution = carrier;
-      }
-      if (carrier == 2 && millis() - lastRTKFixMsg_ms > rtkFixMsgInterval_ms) {
-        lastRTKFixMsg_ms = millis();
-        Serial.print(F("*** RTK FIXED | siv=")); Serial.print(siv);
-        Serial.print(F(" | rtcm="));             Serial.print(rtcmTotalBytes);
-        Serial.println(F("B ***"));
-      }
     }
 
     // Connect / reconnect
@@ -405,7 +435,6 @@ void beginClient() {
       }
       delay(500);
 
-      // HTTP/1.1 — Polaris requires Ntrip-Version: Ntrip/2.0
       const int REQ_SIZE = 512;
       char serverRequest[REQ_SIZE];
       snprintf(serverRequest, REQ_SIZE,
@@ -433,7 +462,6 @@ void beginClient() {
         delay(2000); continue;
       }
 
-      // Wait for response
       unsigned long timeout = millis();
       bool timedOut = false;
       while (modem.TCPavailable() == 0) {
@@ -446,9 +474,6 @@ void beginClient() {
       }
       if (timedOut) { delay(1000); continue; }
 
-      // Read HTTP response header — scan for \r\n\r\n.
-      // Bytes arriving after the header boundary go into _cellBuf so the
-      // chunked decoder picks them up immediately on the first readByteCellular() call.
       char headerBuf[512] = {0};
       int  headerLen  = 0;
       bool headerDone = false;
@@ -503,7 +528,7 @@ void beginClient() {
       lastReceivedRTCM_ms = millis();
     }
 
-    // Refresh GGA so Polaris VRS keeps tracking the rover
+    // Refresh GGA
     if (tcpConnected && millis() - lastGGASent_ms > ggaInterval_ms) {
       String gga = buildGGA();
       modem.TCPsend((char*)gga.c_str(), gga.length());
@@ -511,7 +536,7 @@ void beginClient() {
       Serial.println(F("GGA refreshed"));
     }
 
-    // HTTP/1.1 chunked decoder — triggered when modem buffer or local cache has data
+    // HTTP/1.1 chunked decoder
     if (modem.TCPavailable() > 0 || _cellBufIdx < _cellBufLen) {
       long rtcmCount = 0;
 
@@ -586,6 +611,17 @@ void beginClient() {
       }
     }
 
+    // [TELEMETRY] Close NTRIP, post snapshot, let loop reconnect.
+    if (tcpConnected && millis() - lastTelemetry_ms > telemetryInterval_ms) {
+      Serial.println(F("[telemetry] Pausing NTRIP to post telemetry..."));
+      modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+      tcpConnected = false;
+      _cellBufLen = _cellBufIdx = 0;
+      postTelemetry();
+      lastTelemetry_ms = millis();
+      // outer loop reconnects NTRIP on the next iteration
+    }
+
     if (millis() - lastReceivedRTCM_ms > maxTimeBeforeHangup_ms) {
       Serial.println(F("RTCM timeout — reconnecting"));
       modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
@@ -602,8 +638,7 @@ void beginClient() {
 }
 
 // ============================================================
-// Cellular + SIO / fixed-base caster beginClient
-// HTTP/1.0, no chunked decoder, no GGA required.
+// Cellular + SIO beginClient
 // ============================================================
 #else
 
@@ -632,25 +667,10 @@ void beginClient() {
     if (millis() - lastDiag_ms > 1000) {
       lastDiag_ms = millis();
       myGNSS.getPVT();
-      uint8_t carrier = myGNSS.getCarrierSolutionType();
-      uint8_t siv     = myGNSS.getSIV();
-      Serial.print(F("[diag] carrier="));  Serial.print(carrier);
-      Serial.print(F(" siv="));            Serial.print(siv);
+      Serial.print(F("[diag] carrier="));  Serial.print(myGNSS.getCarrierSolutionType());
+      Serial.print(F(" siv="));            Serial.print(myGNSS.getSIV());
       Serial.print(F(" rtcmTotal="));      Serial.print(rtcmTotalBytes);
       Serial.print(F(" reconnects="));     Serial.println(reconnectCount);
-
-      if (carrier != lastCarrierSolution) {
-        if      (carrier == 2) Serial.println(F("===== RTK FIXED! ====="));
-        else if (carrier == 1) Serial.println(F("[RTK] Float solution acquired"));
-        else if (lastCarrierSolution != 255) Serial.println(F("[RTK] Fix lost — no RTK"));
-        lastCarrierSolution = carrier;
-      }
-      if (carrier == 2 && millis() - lastRTKFixMsg_ms > rtkFixMsgInterval_ms) {
-        lastRTKFixMsg_ms = millis();
-        Serial.print(F("*** RTK FIXED | siv=")); Serial.print(siv);
-        Serial.print(F(" | rtcm="));             Serial.print(rtcmTotalBytes);
-        Serial.println(F("B ***"));
-      }
     }
 
     // Connect / reconnect
@@ -675,7 +695,6 @@ void beginClient() {
       }
       delay(500);
 
-      // HTTP/1.0 NTRIP request — no chunked encoding
       char credentials[200] = "";
       if (strlen(casterUser) > 0) {
         char userCreds[128];
@@ -698,9 +717,6 @@ void beginClient() {
         delay(2000); continue;
       }
 
-      // Read HTTP response header — scan for \r\n\r\n.
-      // Trailing bytes after the header are forwarded to the ZED-F9P;
-      // the F9P syncs to the RTCM3 0xD3 preamble and ignores any leading text.
       char headerBuf[512] = {0};
       int  headerLen = 0; bool headerDone = false;
       unsigned long headerTimeout = millis();
@@ -753,6 +769,16 @@ void beginClient() {
         lastReceivedRTCM_ms = millis();
         Serial.print(F("RTCM → ZED: ")); Serial.println(got);
       }
+    }
+
+    // [TELEMETRY] Close NTRIP, post snapshot, let loop reconnect.
+    if (tcpConnected && millis() - lastTelemetry_ms > telemetryInterval_ms) {
+      Serial.println(F("[telemetry] Pausing NTRIP to post telemetry..."));
+      modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+      tcpConnected = false;
+      postTelemetry();
+      lastTelemetry_ms = millis();
+      // outer loop reconnects NTRIP on the next iteration
     }
 
     if (millis() - lastReceivedRTCM_ms > maxTimeBeforeHangup_ms) {

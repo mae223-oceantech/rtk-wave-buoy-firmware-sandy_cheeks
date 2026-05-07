@@ -86,6 +86,7 @@ void setup() {
   initialize_gnss_uart_f();
 
   // Initialize Modem
+
   pinMode(RST, OUTPUT);
   digitalWrite(RST, HIGH);
   
@@ -94,11 +95,15 @@ void setup() {
   modem.powerOn(BOTLETICS_PWRKEY);
 
   // Start modem serial
+  // NOTE: ESP32 HardwareSerial::begin signature is begin(baud, config, rxPin, txPin),
+  // so the canonical call would be (..., RX_MODEM, TX_MODEM). The order below
+  // (TX_MODEM, RX_MODEM) appears swapped, but it matches the TA's working setup —
+  // do not "fix" without confirming on hardware first.
   modemSS.begin(115200, SERIAL_8N1, TX_MODEM, RX_MODEM);
   Serial.println(F("Configuring modem to 9600 baud"));
   SerialBT.println(F("Configuring modem to 9600 baud"));
   modemSS.println("AT+IPR=9600");
-  delay(1000);
+  delay(3000);
   modemSS.begin(9600, SERIAL_8N1, TX_MODEM, RX_MODEM);
 
   if (!modem.begin(modemSS)) {
@@ -128,6 +133,7 @@ void setup() {
 
 void loop() {
   // Handle user AT commands
+  Serial.println("I'm alive");
   if (Serial.available()) {
     Serial.print(F("modem> "));
     SerialBT.println(F("modem>" ));
