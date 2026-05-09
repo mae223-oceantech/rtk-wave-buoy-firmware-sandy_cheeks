@@ -133,7 +133,6 @@ void setup() {
 
 void loop() {
   // Handle user AT commands
-  Serial.println("I'm alive");
   if (Serial.available()) {
     Serial.print(F("modem> "));
     SerialBT.println(F("modem>" ));

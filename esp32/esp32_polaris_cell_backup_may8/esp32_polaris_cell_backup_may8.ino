@@ -10,9 +10,7 @@
 
     USE_POLARIS_CELLULAR defined:
       Cellular + Point One Nav Polaris
-      Transparent TCP (AT+CIPMODE=1), NTRIP 2.0 chunked stream.
-      All data I/O direct via modemSS — no AT command overhead on data path.
-      GGA sent on connect and every ggaInterval_ms.
+      HTTP/1.1 chunked stream, GGA sent every 10 s.
       Polaris is a VRS — it needs your GPS position to synthesize a
       virtual base station near the rover, so GGA is sent upstream
       over the same TCP connection that RTCM comes down on.
@@ -105,6 +103,8 @@ unsigned long lastRTKFixMsg_ms       = 0;
 const unsigned long rtkFixMsgInterval_ms = 10000;  // repeat RTK-fixed banner every 10 s
 
 #ifdef USE_POLARIS_CELLULAR
+int desyncSuspectCount   = 0;
+int trailingCRLFMismatch = 0;
 const unsigned long ggaInterval_ms = 30000;
 #endif
 
@@ -148,7 +148,7 @@ void setup() {
   Serial.println(F("Powering on modem..."));
   modem.powerOn(BOTLETICS_PWRKEY);
 
-  // SIM7000 boots at 115200; stay at 115200 for transparent-mode throughput.
+  // SIM7000 boots at 115200; drop to 9600 for stability
   // NOTE: ESP32 HardwareSerial::begin signature is begin(baud, config, rxPin, txPin),
   // so the canonical call would be (..., RX_MODEM, TX_MODEM). The order below
   // (TX_MODEM, RX_MODEM) appears swapped, but it matches the TA's working setup —
@@ -157,9 +157,7 @@ void setup() {
   Serial.println(F("Configuring modem to 115200 baud"));
   modemSS.println("AT+IPR=115200");
   delay(1000);
-  // Re-init with 4096-byte RX buffer — absorbs RTCM bursts during getPVT() blocking
-  modemSS.setRxBufferSize(4096);
-  modemSS.begin(115200, SERIAL_8N1, TX_MODEM, RX_MODEM);
+  modemSS.begin(38400, SERIAL_8N1, TX_MODEM, RX_MODEM);
 
   if (!modem.begin(modemSS)) {
     Serial.println(F("ERROR: SIM7000 not found — check wiring and LiPo battery"));
@@ -306,12 +304,24 @@ String buildGGA() {
   return String(sentence);
 }
 
-// Serve one byte directly from the transparent UART pipe.
-// No AT command overhead — bytes arrive at UART speed (~87 µs each at 115200).
-int readByteTransparent(uint32_t timeout_ms) {
+// Byte cache for the chunked decoder. modem.TCPread() delivers batches;
+// readByteCellular() serves one byte at a time, refilling from TCPread() when empty.
+static uint8_t _cellBuf[1460];
+static int     _cellBufLen = 0;
+static int     _cellBufIdx = 0;
+
+int readByteCellular(uint32_t timeout_ms) {
   uint32_t start = millis();
   while (millis() - start < timeout_ms) {
-    if (modemSS.available()) return modemSS.read();
+    if (_cellBufIdx < _cellBufLen) return (uint8_t)_cellBuf[_cellBufIdx++];
+    _cellBufLen = 0; _cellBufIdx = 0;
+    uint16_t avail = modem.TCPavailable();
+    if (avail > 0) {
+      int got = modem.TCPread(_cellBuf, min((uint16_t)sizeof(_cellBuf), avail));
+      if (got > 0) { _cellBufLen = got; continue; }
+    }
+    if (!modem.TCPconnected()) return -1;
+    delay(1);
   }
   return -1;
 }
@@ -319,27 +329,16 @@ int readByteTransparent(uint32_t timeout_ms) {
 
 // ============================================================
 // Cellular + Polaris beginClient
-// Transparent TCP (AT+CIPMODE=1), NTRIP 2.0 chunked stream.
-// All data I/O is direct modemSS reads — zero AT command overhead on the data path.
-// GGA sent on connect and every ggaInterval_ms.
+// HTTP/1.1 chunked stream, GGA sent on connect and every ggaInterval_ms.
 // ============================================================
 #ifdef USE_POLARIS_CELLULAR
 
-// Return to AT command mode from a transparent TCP session.
-// The 1100 ms guards satisfy the SIM7000 escape-sequence timing requirement.
-static void escapeTransparentMode() {
-  delay(1100);
-  modemSS.print("+++");
-  delay(1100);
-  while (modemSS.available()) modemSS.read();  // discard the "OK" echo
-}
-
 void beginClient() {
-  Serial.println(F("Subscribing to Polaris via cellular (transparent TCP, NTRIP 2.0)..."));
-  bool tcpConnected      = false;
-  bool inTransparentMode = false;
-  unsigned long lastGGASent_ms = 0;
-  unsigned long lastDiag_ms    = 0;
+  Serial.println(F("Subscribing to Polaris via cellular (HTTP/1.1 + chunked + GGA)..."));
+  bool tcpConnected       = false;
+  unsigned long lastGGASent_ms    = 0;
+  unsigned long lastDiag_ms       = 0;
+  unsigned long lastSocketCheck_ms = 0;
 
   while (ntripRunning) {
 
@@ -363,9 +362,11 @@ void beginClient() {
       myGNSS.getPVT();
       uint8_t carrier = myGNSS.getCarrierSolutionType();
       uint8_t siv     = myGNSS.getSIV();
-      Serial.print(F("[diag] carrier="));  Serial.print(carrier);
-      Serial.print(F(" siv="));            Serial.print(siv);
-      Serial.print(F(" rtcmTotal="));      Serial.println(rtcmTotalBytes);
+      Serial.print(F("[diag] carrier="));   Serial.print(carrier);
+      Serial.print(F(" siv="));             Serial.print(siv);
+      Serial.print(F(" rtcmTotal="));       Serial.print(rtcmTotalBytes);
+      Serial.print(F(" desyncSuspect="));   Serial.print(desyncSuspectCount);
+      Serial.print(F(" crlfMismatch="));    Serial.println(trailingCRLFMismatch);
 
       if (carrier != lastCarrierSolution) {
         if      (carrier == 2) Serial.println(F("===== RTK FIXED! ====="));
@@ -381,15 +382,18 @@ void beginClient() {
       }
     }
 
-    // Connect / reconnect
-    if (!tcpConnected) {
-      if (inTransparentMode) {
-        // Escape back to AT command mode before touching any AT commands
-        escapeTransparentMode();
-        modem.sendCheckReply(F("AT+CIPMODE=0"), F("OK"), 2000);
-        modem.sendCheckReply(F("AT+CIPCLOSE"),  F("CLOSE OK"), 3000);
-        inTransparentMode = false;
-        delay(500);
+    // Connect / reconnect — only poll AT+CIPSTATUS every 5 s while streaming
+    bool socketDead = !tcpConnected;
+    if (tcpConnected && millis() - lastSocketCheck_ms > 5000) {
+      lastSocketCheck_ms = millis();
+      socketDead = !modem.TCPconnected();
+    }
+    if (socketDead) {
+      if (tcpConnected) {
+        modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+        tcpConnected = false;
+        _cellBufLen = _cellBufIdx = 0;
+        delay(1000);
       }
 
       if (!ensureGPRS()) { delay(5000); continue; }
@@ -401,41 +405,13 @@ void beginClient() {
       Serial.print(F("Connecting to ")); Serial.print(casterHost);
       Serial.print(F(":")); Serial.println(casterPort);
 
-      // Disable AT+CIPRXGET buffering and switch to transparent pipe
-      modem.sendCheckReply(F("AT+CIPRXGET=0"), F("OK"), 2000);
-      if (!modem.sendCheckReply(F("AT+CIPMODE=1"), F("OK"), 2000)) {
-        Serial.println(F("AT+CIPMODE=1 failed — retrying in 2 s"));
+      if (!modem.TCPconnect((char*)casterHost, casterPort)) {
+        Serial.println(F("TCP connect failed — retrying in 2 s"));
         delay(2000); continue;
       }
+      delay(500);
 
-      // Issue AT+CIPSTART directly — Botletics TCPconnect() sets AT+CIPRXGET=1
-      // which conflicts with transparent mode.
-      modemSS.print(F("AT+CIPSTART=\"TCP\",\""));
-      modemSS.print(casterHost);
-      modemSS.print(F("\","));
-      modemSS.println(casterPort);
-
-      // Wait for "CONNECT OK" — after this modemSS is a transparent data pipe
-      char cipBuf[64] = {0};
-      int  cipLen = 0;
-      unsigned long cipTimeout = millis();
-      bool cipOk = false;
-      while (millis() - cipTimeout < 15000) {
-        if (modemSS.available()) {
-          char c = (char)modemSS.read();
-          if (cipLen < (int)sizeof(cipBuf) - 1) cipBuf[cipLen++] = c;
-          if (strstr(cipBuf, "CONNECT OK") != NULL) { cipOk = true; break; }
-          if (strstr(cipBuf, "ERROR")      != NULL) break;
-        }
-      }
-      if (!cipOk) {
-        Serial.print(F("TCP connect failed: ")); Serial.println(cipBuf);
-        modem.sendCheckReply(F("AT+CIPMODE=0"), F("OK"), 2000);
-        delay(2000); continue;
-      }
-      inTransparentMode = true;
-
-      // HTTP/1.1, Ntrip-Version: Ntrip/2.0 — Polaris VRS requires v2.0
+      // HTTP/1.1 — Polaris requires Ntrip-Version: Ntrip/2.0
       const int REQ_SIZE = 512;
       char serverRequest[REQ_SIZE];
       snprintf(serverRequest, REQ_SIZE,
@@ -456,57 +432,103 @@ void beginClient() {
       }
       strncat(serverRequest, credentials, REQ_SIZE - strlen(serverRequest) - 1);
       strncat(serverRequest, "\r\n",     REQ_SIZE - strlen(serverRequest) - 1);
-      modemSS.print(serverRequest);
 
-      // Read HTTP response header from transparent pipe
+      if (!modem.TCPsend((char*)serverRequest, strlen(serverRequest))) {
+        Serial.println(F("Send failed — retrying in 2 s"));
+        modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+        delay(2000); continue;
+      }
+
+      // Wait for response
+      unsigned long timeout = millis();
+      bool timedOut = false;
+      while (modem.TCPavailable() == 0) {
+        if (millis() - timeout > 5000) {
+          Serial.println(F("Caster timed out — retrying in 1 s"));
+          modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+          timedOut = true; break;
+        }
+        delay(10);
+      }
+      if (timedOut) { delay(1000); continue; }
+
+      // Read HTTP response header — scan for \r\n\r\n.
+      // Bytes arriving after the header boundary go into _cellBuf so the
+      // chunked decoder picks them up immediately on the first readByteCellular() call.
       char headerBuf[512] = {0};
       int  headerLen  = 0;
       bool headerDone = false;
+      _cellBufLen = _cellBufIdx = 0;
       unsigned long headerTimeout = millis();
 
-      while (!headerDone && millis() - headerTimeout < 10000) {
-        if (modemSS.available()) {
-          char c = (char)modemSS.read();
-          if (headerLen < (int)sizeof(headerBuf) - 1)
-            headerBuf[headerLen++] = c;
-          if (headerLen >= 4 &&
-              headerBuf[headerLen-4] == '\r' && headerBuf[headerLen-3] == '\n' &&
-              headerBuf[headerLen-2] == '\r' && headerBuf[headerLen-1] == '\n')
-            headerDone = true;
+      while (!headerDone && millis() - headerTimeout < 5000) {
+        uint16_t avail = modem.TCPavailable();
+        if (avail > 0) {
+          uint8_t chunk[128];
+          uint16_t got = modem.TCPread(chunk, min((uint16_t)sizeof(chunk), avail));
+          for (int i = 0; i < (int)got; i++) {
+            if (!headerDone) {
+              if (headerLen < (int)sizeof(headerBuf) - 1)
+                headerBuf[headerLen++] = (char)chunk[i];
+              if (headerLen >= 4 &&
+                  headerBuf[headerLen-4] == '\r' && headerBuf[headerLen-3] == '\n' &&
+                  headerBuf[headerLen-2] == '\r' && headerBuf[headerLen-1] == '\n') {
+                headerDone = true;
+                int trailing = (int)got - (i + 1);
+                if (trailing > 0 && trailing <= (int)sizeof(_cellBuf)) {
+                  memcpy(_cellBuf, chunk + i + 1, trailing);
+                  _cellBufLen = trailing; _cellBufIdx = 0;
+                }
+              }
+            }
+          }
         }
+        delay(10);
       }
+
       Serial.print(F("Caster response: ")); Serial.println(headerBuf);
 
       if (strstr(headerBuf, "401") != NULL) {
         Serial.println(F("401 Unauthorized — check casterUser/casterUserPW in secrets.h"));
-        escapeTransparentMode();
-        modem.sendCheckReply(F("AT+CIPMODE=0"), F("OK"), 2000);
-        modem.sendCheckReply(F("AT+CIPCLOSE"),  F("CLOSE OK"), 3000);
-        inTransparentMode = false;
         ntripRunning = false; digitalWrite(LED_PIN, LOW); return;
       }
       if (strstr(headerBuf, "200") == NULL) {
         Serial.println(F("NTRIP connection failed — retrying in 2 s"));
-        escapeTransparentMode();
-        modem.sendCheckReply(F("AT+CIPMODE=0"), F("OK"), 2000);
-        modem.sendCheckReply(F("AT+CIPCLOSE"),  F("CLOSE OK"), 3000);
-        inTransparentMode = false;
+        modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+        _cellBufLen = _cellBufIdx = 0;
         delay(2000); continue;
       }
 
-      // Drain any RTCM bytes Polaris sent before receiving our GGA (discard them)
-      unsigned long drainEnd = millis() + 200;
-      while (millis() < drainEnd) {
-        if (modemSS.available()) { modemSS.read(); drainEnd = millis() + 50; }
+      // Polaris streams RTCM chunks immediately after 200 OK, before it receives
+      // GGA. Drain those bytes now so no +CIPRXGET: 1 URCs are pending when
+      // AT+CIPSEND for the GGA is issued — otherwise the URC interrupts the >
+      // prompt and TCPsend() fails.
+      {
+        uint16_t avail = modem.TCPavailable();
+        while (avail > 0) {
+          uint8_t tmp[1460];
+          modem.TCPread(tmp, min((uint16_t)sizeof(tmp), avail));
+          avail = modem.TCPavailable();
+        }
+        _cellBufLen = _cellBufIdx = 0;
+        Serial.print(F("[diag] Drained pre-GGA RTCM — avail now: "));
+        Serial.println(modem.TCPavailable());
       }
 
-      // Send GGA — modemSS.print() goes directly over the TCP connection
       String gga = buildGGA();
-      modemSS.print(gga);
+      bool ggaSendOk = modem.TCPsend((char*)gga.c_str(), gga.length());
+      Serial.print(F("[diag] GGA TCPsend returned: ")); Serial.println(ggaSendOk);
       lastGGASent_ms = millis();
       Serial.print(F("Sent GGA: ")); Serial.print(gga);
 
-      Serial.println(F("NTRIP connected via cellular/Polaris (transparent)!"));
+      if (!ggaSendOk) {
+        Serial.println(F("[diag] GGA send failed — dropping socket"));
+        modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+        _cellBufLen = _cellBufIdx = 0;
+        delay(2000); continue;
+      }
+
+      Serial.println(F("NTRIP connected via cellular/Polaris!"));
       tcpConnected = true;
       lastReceivedRTCM_ms = millis();
     }
@@ -514,19 +536,19 @@ void beginClient() {
     // Refresh GGA so Polaris VRS keeps tracking the rover
     if (tcpConnected && millis() - lastGGASent_ms > ggaInterval_ms) {
       String gga = buildGGA();
-      modemSS.print(gga);
+      modem.TCPsend((char*)gga.c_str(), gga.length());
       lastGGASent_ms = millis();
       Serial.println(F("GGA refreshed"));
     }
 
-    // HTTP/1.1 chunked decoder — all reads via readByteTransparent() (direct UART, no AT)
-    if (modemSS.available()) {
+    // HTTP/1.1 chunked decoder — triggered when modem buffer or local cache has data
+    if (modem.TCPavailable() > 0 || _cellBufIdx < _cellBufLen) {
       long rtcmCount = 0;
 
       char chunkSizeBuf[12];
       int  idx = 0; bool sizeReadOk = true;
       while (idx < (int)sizeof(chunkSizeBuf) - 1) {
-        int b = readByteTransparent(5000);
+        int b = readByteCellular(5000);
         if (b < 0) { sizeReadOk = false; break; }
         if (b == '\n') break;
         if (b != '\r') chunkSizeBuf[idx++] = (char)b;
@@ -535,18 +557,22 @@ void beginClient() {
 
       if (!sizeReadOk) {
         Serial.println(F("[desync?] timeout reading chunk size — dropping socket"));
-        tcpConnected = false;
+        modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+        tcpConnected = false; _cellBufLen = _cellBufIdx = 0;
       } else {
         long chunkSize = strtol(chunkSizeBuf, NULL, 16);
 
         if (chunkSize == 0) {
           Serial.println(F("[stream] chunkSize=0 — caster closed stream"));
-          tcpConnected = false;
+          modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+          tcpConnected = false; _cellBufLen = _cellBufIdx = 0;
         } else if (chunkSize < 0 || chunkSize > 4096) {
+          desyncSuspectCount++;
           Serial.print(F("[desync?] chunkSize=")); Serial.print(chunkSize);
           Serial.print(F(" hex='")); Serial.print(chunkSizeBuf);
           Serial.println(F("' — dropping socket"));
-          tcpConnected = false;
+          modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+          tcpConnected = false; _cellBufLen = _cellBufIdx = 0;
         } else {
           uint8_t rtcmData[1024];
           long remaining = chunkSize; bool payloadOk = true;
@@ -554,7 +580,7 @@ void beginClient() {
             int want = remaining > (long)sizeof(rtcmData) ? (int)sizeof(rtcmData) : (int)remaining;
             int got  = 0;
             while (got < want) {
-              int b = readByteTransparent(5000);
+              int b = readByteCellular(5000);
               if (b < 0) { payloadOk = false; break; }
               rtcmData[got++] = (uint8_t)b;
             }
@@ -565,17 +591,20 @@ void beginClient() {
 
           if (!payloadOk) {
             Serial.println(F("[desync?] short read on payload — dropping socket"));
-            tcpConnected = false;
+            modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+            tcpConnected = false; _cellBufLen = _cellBufIdx = 0;
           } else {
-            int b1 = readByteTransparent(5000);
-            int b2 = readByteTransparent(5000);
+            int b1 = readByteCellular(5000);
+            int b2 = readByteCellular(5000);
             if (b1 != '\r' || b2 != '\n') {
-              Serial.print(F("[desync?] trailing CRLF: 0x"));
+              trailingCRLFMismatch++;
+              Serial.print(F("[desync?] trailing CRLF mismatch: 0x"));
               if (b1 < 0) Serial.print(F("--")); else Serial.print((uint8_t)b1, HEX);
               Serial.print(F(" 0x"));
               if (b2 < 0) Serial.print(F("--")); else Serial.print((uint8_t)b2, HEX);
               Serial.println(F(" — dropping socket"));
-              tcpConnected = false;
+              modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+              tcpConnected = false; _cellBufLen = _cellBufIdx = 0;
             }
           }
         }
@@ -589,17 +618,15 @@ void beginClient() {
 
     if (millis() - lastReceivedRTCM_ms > maxTimeBeforeHangup_ms) {
       Serial.println(F("RTCM timeout — reconnecting"));
-      tcpConnected = false;
-      // inTransparentMode stays true — escape is handled at the top of the reconnect block
+      modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
+      tcpConnected = false; _cellBufLen = _cellBufIdx = 0;
       lastReceivedRTCM_ms = millis(); delay(1000); continue;
     }
+
+    delay(10);
   }
 
-  if (inTransparentMode) {
-    escapeTransparentMode();
-    modem.sendCheckReply(F("AT+CIPMODE=0"), F("OK"), 2000);
-    modem.sendCheckReply(F("AT+CIPCLOSE"),  F("CLOSE OK"), 3000);
-  }
+  if (tcpConnected) modem.sendCheckReply(F("AT+CIPCLOSE"), F("CLOSE OK"), 5000);
   Serial.println(F("NTRIP stopped"));
   ntripRunning = false; digitalWrite(LED_PIN, LOW);
 }
